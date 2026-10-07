@@ -85,6 +85,18 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "subscriptions"]:
+                    return self._send(200, {"items": service.list_subscriptions()})
+                if parts == ["api", "deliveries"]:
+                    query = parse_qs(parsed.query)
+                    event_id = query.get("event_id", [None])[0]
+                    return self._send(200, {"items": service.list_deliveries(event_id=event_id)})
+                if parts == ["api", "withdrawals"]:
+                    query = parse_qs(parsed.query)
+                    event_id = query.get("event_id", [None])[0]
+                    return self._send(200, {"items": service.list_withdrawals(event_id=event_id)})
+                if len(parts) == 4 and parts[:2] == ["api", "withdrawals"] and parts[3] == "receipts":
+                    return self._send(200, {"items": service.list_receipts(parts[2])})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -137,6 +149,19 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
+                    )
+                if len(parts) == 2 and parts == ["api", "subscriptions"]:
+                    body = self._body()
+                    return self._send(
+                        201, service.create_subscription(actor, body.get("subscriber"))
+                    )
+                if len(parts) == 4 and parts[:2] == ["api", "deliveries"] and parts[3] == "retry":
+                    return self._send(200, service.retry_delivery(actor, parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "withdrawals"] and parts[3] == "ack":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.ack_withdrawal(actor, parts[2], body.get("subscription_id")),
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
