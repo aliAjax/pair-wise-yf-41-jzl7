@@ -87,6 +87,10 @@ def create_handler(service, rules, static_dir):
                     return self._send(200, {"items": service.audit_log()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "events" and parts[3] == "deliveries":
+                    return self._send(200, service.list_deliveries(parts[2]))
+                if len(parts) == 3 and parts[0] == "api" and parts[1] == "deliveries":
+                    return self._send(200, service.get_delivery(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
@@ -117,6 +121,15 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         200,
                         service.transition(actor, parts[2], action, data, expected),
+                    )
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "deliveries" and parts[3] == "actions":
+                    body = self._body()
+                    action = body.pop("action", None)
+                    if not action:
+                        raise ValidationError("action is required")
+                    return self._send(
+                        200,
+                        service.delivery_action(actor, parts[2], action, body.pop("data", body)),
                     )
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
                     body = self._body()

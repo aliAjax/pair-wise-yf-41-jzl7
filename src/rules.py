@@ -54,13 +54,55 @@ CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
 
 
 class RuleEngine:
-    ALIASES = {'stations': 'station', 'events': 'event'}
-    INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
-    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
-    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
+    ALIASES = {'stations': 'station', 'events': 'event', 'subscriptions': 'subscription'}
+    INITIAL_STATUS = {'station': 'online', 'event': 'candidate', 'subscription': 'active'}
+    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawing'), 'settle_withdraw': (('withdrawing',), 'withdrawn')}, 'subscription': {'disable': (('active',), 'disabled'), 'enable': (('disabled',), 'active')}}
+    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports'), 'subscription': ('subscriber', 'endpoint')}
     ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
-    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
+    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst'), 'subscription': ('admin',)}
+    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer'), 'settle_withdraw': ('admin', 'reviewer'), 'disable': ('admin',), 'enable': ('admin',)}
+
+    # Delivery ledger rules (对账记录):
+    # publish: pending -> delivered | failed; failed retries on the same record.
+    # withdraw: pending -> sent | failed; sent -> acknowledged (回执).
+    DELIVERY_ACTION_ROLES = {'dispatch': ('admin', 'reviewer'), 'ack': ('admin', 'reviewer')}
+    DELIVERY_OUTCOMES = {
+        'publish': {
+            'pending': {'delivered': 'delivered', 'failed': 'failed'},
+            'failed': {'delivered': 'delivered', 'failed': 'failed'},
+        },
+        'withdraw': {
+            'pending': {'sent': 'sent', 'failed': 'failed'},
+            'failed': {'sent': 'sent', 'failed': 'failed'},
+        },
+    }
+    DELIVERY_TERMINAL = ('delivered', 'acknowledged')
+    DELIVERY_UNDELIVERED = ('pending', 'failed')
+
+    def validate_delivery_action(self, actor, action):
+        self._ensure_role(actor, self.DELIVERY_ACTION_ROLES.get(action, ('admin',)))
+
+    def delivery_dispatch_target(self, delivery, outcome):
+        status = delivery["status"]
+        if status in self.DELIVERY_TERMINAL:
+            return None
+        if status == "void":
+            raise InvalidTransition("delivery %s is void" % delivery["id"])
+        outcomes = self.DELIVERY_OUTCOMES.get(delivery["kind"], {}).get(status, {})
+        if outcome not in outcomes:
+            raise ValidationError(
+                "outcome must be one of: " + ", ".join(sorted(outcomes) or ["<none>"])
+            )
+        return outcomes[outcome]
+
+    def delivery_ack_target(self, delivery):
+        if delivery["kind"] != "withdraw":
+            raise InvalidTransition("only withdraw deliveries accept receipts")
+        if delivery["status"] == "acknowledged":
+            return None
+        if delivery["status"] != "sent":
+            raise InvalidTransition("withdraw notice has not been dispatched")
+        return "acknowledged"
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

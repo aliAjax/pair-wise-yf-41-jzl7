@@ -19,6 +19,9 @@ def main(argv=None):
     repository = SQLiteRepository(args.db)
     rules = RuleEngine()
     service = DomainService(repository, rules)
+    backfill = service.backfill_deliveries()
+    if backfill["backfilled"]:
+        print("delivery backfill: %s records created" % backfill["backfilled"], flush=True)
     static_dir = Path(__file__).resolve().parent / "static"
     server = create_server(args.host, args.port, service, rules, str(static_dir))
 

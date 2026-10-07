@@ -54,6 +54,26 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS deliveries (
+                    id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    event_version INTEGER NOT NULL,
+                    subscriber TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_unique
+                    ON deliveries(event_id, event_version, subscriber, kind);
+                CREATE INDEX IF NOT EXISTS idx_deliveries_event
+                    ON deliveries(event_id, kind, status);
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
             """)
 
     @staticmethod
@@ -194,6 +214,129 @@ class SQLiteRepository:
                 "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
+            )
+
+    @staticmethod
+    def _delivery_from_row(row):
+        return {
+            "id": row["id"],
+            "event_id": row["event_id"],
+            "event_version": int(row["event_version"]),
+            "subscriber": row["subscriber"],
+            "kind": row["kind"],
+            "status": row["status"],
+            "attempts": int(row["attempts"]),
+            "detail": json.loads(row["detail"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def create_delivery(self, delivery_id, event_id, event_version, subscriber, kind,
+                        status="pending", detail=None):
+        # INSERT OR IGNORE: a retry reuses the existing record for the same
+        # (event, version, subscriber, kind) instead of creating a duplicate.
+        now = utcnow()
+        payload = json.dumps(detail or {}, ensure_ascii=False, sort_keys=True)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO deliveries"
+                "(id, event_id, event_version, subscriber, kind, status, attempts, detail, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                (delivery_id, event_id, event_version, subscriber, kind, status, payload, now, now),
+            )
+        return self.find_delivery(event_id, event_version, subscriber, kind)
+
+    def find_delivery(self, event_id, event_version, subscriber, kind):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM deliveries WHERE event_id = ? AND event_version = ? "
+                "AND subscriber = ? AND kind = ?",
+                (event_id, event_version, subscriber, kind),
+            ).fetchone()
+        return self._delivery_from_row(row) if row else None
+
+    def get_delivery(self, delivery_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM deliveries WHERE id = ?", (delivery_id,)
+            ).fetchone()
+        return self._delivery_from_row(row) if row else None
+
+    def list_deliveries(self, event_id=None, kind=None, status=None):
+        clauses = []
+        params = []
+        if event_id:
+            clauses.append("event_id = ?")
+            params.append(event_id)
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM deliveries" + where + " ORDER BY created_at, id", params
+            ).fetchall()
+        return [self._delivery_from_row(row) for row in rows]
+
+    def update_delivery(self, delivery_id, expected_status, status, attempts, detail=None):
+        now = utcnow()
+        payload = json.dumps(detail or {}, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM deliveries WHERE id = ?", (delivery_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("delivery not found: " + delivery_id)
+            if row["status"] != expected_status:
+                raise ConflictError(
+                    "delivery status conflict: expected %s, found %s"
+                    % (expected_status, row["status"])
+                )
+            connection.execute(
+                "UPDATE deliveries SET status = ?, attempts = ?, detail = ?, updated_at = ? "
+                "WHERE id = ?",
+                (status, attempts, payload, now, delivery_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_delivery(delivery_id)
+
+    def void_deliveries(self, event_id, kind="publish", statuses=("pending", "failed"),
+                        before_version=None):
+        now = utcnow()
+        placeholders = ", ".join("?" for _ in statuses)
+        sql = (
+            "UPDATE deliveries SET status = 'void', updated_at = ? "
+            "WHERE event_id = ? AND kind = ? AND status IN (" + placeholders + ")"
+        )
+        params = [now, event_id, kind] + list(statuses)
+        if before_version is not None:
+            sql += " AND event_version < ?"
+            params.append(before_version)
+        with self._connect() as connection:
+            cursor = connection.execute(sql, params)
+            return cursor.rowcount
+
+    def get_meta(self, key):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key, value):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value)
             )
 
     def ping(self):
